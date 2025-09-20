@@ -44,6 +44,11 @@ logging:
       enabled: false
 
 seata:
+  metrics:
+    enabled: false
+  server:
+    raft:
+      election-timeout-ms: 20000
   config:
     # support: nacos, consul, apollo, zk, etcd3
     type: file
