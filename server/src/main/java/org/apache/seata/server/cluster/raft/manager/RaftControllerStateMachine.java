@@ -38,6 +38,7 @@ import org.apache.seata.common.util.StringUtils;
 import org.apache.seata.config.ConfigurationFactory;
 import org.apache.seata.core.serializer.SerializerType;
 import org.apache.seata.server.cluster.listener.ClusterChangeEvent;
+import org.apache.seata.server.cluster.listener.TxgChangeEvent;
 import org.apache.seata.server.cluster.raft.RaftStateMachine;
 import org.apache.seata.server.cluster.raft.context.SeataClusterContext;
 import org.apache.seata.server.cluster.raft.execute.RaftMsgExecute;
@@ -628,5 +629,70 @@ public class RaftControllerStateMachine extends RaftStateMachine {
 
     public RaftClusterMetadata getRaftLeaderMetadata() {
         return raftClusterMetadata;
+    }
+
+    /**
+     * Handle TXG leader change notification
+     */
+    public void handleTxgLeaderChange(String txgId, long newTerm, Node newLeader) {
+        LOGGER.info("Received TXG leader change notification: {} (term: {})", txgId, newTerm);
+
+        try {
+            // Update TXG metadata in the store
+            RaftClusterMetadata updatedMetadata = raftGroupStoreManager.getTxgClusterMetadata(txgId);
+            if (updatedMetadata != null && newTerm > updatedMetadata.getTerm()) {
+                updatedMetadata.setTerm(newTerm);
+                updatedMetadata.setLeader(newLeader);
+
+                // Update the store
+                raftGroupStoreManager.updateTxgClusterMetadata(txgId, updatedMetadata);
+
+                // Notify watchers through the cluster watcher manager
+                ApplicationEventPublisher publisher = (ApplicationEventPublisher)
+                        ObjectHolder.INSTANCE.getObject(OBJECT_KEY_SPRING_APPLICATION_CONTEXT);
+
+                if (publisher != null) {
+                    // Create a custom TXG change event
+                    TxgChangeEvent txgChangeEvent = new TxgChangeEvent(this, txgId, newTerm, newLeader);
+                    publisher.publishEvent(txgChangeEvent);
+                }
+
+                LOGGER.info("Updated TXG metadata for {} with new leader and notified watchers", txgId);
+            }
+        } catch (Exception e) {
+            LOGGER.error("Failed to handle TXG leader change for: {}", txgId, e);
+        }
+    }
+
+    /**
+     * Process TXG metadata update from TXG nodes
+     */
+    public void processTxgMetadataUpdate(String txgId, RaftClusterMetadata metadata) {
+        try {
+            // Validate the update
+            RaftClusterMetadata currentMetadata = raftGroupStoreManager.getTxgClusterMetadata(txgId);
+
+            if (currentMetadata == null || metadata.getTerm() > currentMetadata.getTerm()) {
+                // Update is newer, accept it
+                raftGroupStoreManager.updateTxgClusterMetadata(txgId, metadata);
+
+                // Notify watchers of the change
+                ApplicationEventPublisher publisher = (ApplicationEventPublisher)
+                        ObjectHolder.INSTANCE.getObject(OBJECT_KEY_SPRING_APPLICATION_CONTEXT);
+
+                if (publisher != null) {
+                    TxgChangeEvent txgChangeEvent = new TxgChangeEvent(this, txgId, metadata.getTerm(), metadata.getLeader());
+                    publisher.publishEvent(txgChangeEvent);
+                }
+
+                LOGGER.info("Processed TXG metadata update for {}: term={}, leader={}",
+                        txgId, metadata.getTerm(), metadata.getLeader());
+            } else {
+                LOGGER.debug("Ignored stale TXG metadata update for {}: current_term={}, update_term={}",
+                        txgId, currentMetadata.getTerm(), metadata.getTerm());
+            }
+        } catch (Exception e) {
+            LOGGER.error("Failed to process TXG metadata update for: {}", txgId, e);
+        }
     }
 }

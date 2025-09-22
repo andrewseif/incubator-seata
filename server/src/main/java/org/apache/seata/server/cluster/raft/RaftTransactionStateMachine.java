@@ -39,6 +39,7 @@ import org.apache.seata.common.thread.NamedThreadFactory;
 import org.apache.seata.common.util.CollectionUtils;
 import org.apache.seata.common.util.StringUtils;
 import org.apache.seata.core.serializer.SerializerType;
+import org.apache.seata.discovery.registry.raft.RaftRegistryServiceImpl;
 import org.apache.seata.server.cluster.listener.ClusterChangeEvent;
 import org.apache.seata.server.cluster.raft.context.SeataClusterContext;
 import org.apache.seata.server.cluster.raft.execute.RaftMsgExecute;
@@ -231,6 +232,11 @@ public class RaftTransactionStateMachine extends RaftStateMachine {
                 try {
                     // become the leader again,reloading global session
                     SessionHolder.reload(SessionHolder.getRootSessionManager().allSessions(), SessionMode.RAFT, false);
+                    RaftClusterMetadata currentMetadata = getRaftLeaderMetadata();
+                    if (currentMetadata != null) {
+                        // Push to CG using the registry service
+                        RaftRegistryServiceImpl.pushTxgMetadataChangeToCg(group, currentMetadata);
+                    }
                 } finally {
                     SeataClusterContext.unbindGroup();
                 }
@@ -268,6 +274,18 @@ public class RaftTransactionStateMachine extends RaftStateMachine {
         initSync.compareAndSet(true, false);
         if (isLeader()) {
             changePeers(conf);
+        }
+        //should we run async here?
+        try {
+            // Small delay to ensure metadata is fully updated
+            Thread.sleep(500);
+
+            RaftClusterMetadata currentMetadata = getRaftLeaderMetadata();
+            if (currentMetadata != null) {
+                RaftRegistryServiceImpl.pushTxgMetadataChangeToCg(group, currentMetadata);
+            }
+        } catch (Exception e) {
+            LOGGER.error("Failed to push configuration change to CG for group: {}", group, e);
         }
     }
 
@@ -588,5 +606,12 @@ public class RaftTransactionStateMachine extends RaftStateMachine {
             LOGGER.debug("Failed to get CG leader: {}", e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Periodic metadata sync with CG
+     */
+    private void startPeriodicCgSync() {
+        //do we need periodic sync?
     }
 }

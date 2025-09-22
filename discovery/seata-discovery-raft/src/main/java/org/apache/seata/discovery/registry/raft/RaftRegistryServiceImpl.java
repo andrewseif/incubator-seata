@@ -20,7 +20,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.HashSet;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.http.HttpStatus;
@@ -50,6 +49,7 @@ import org.apache.seata.discovery.registry.RegistryService;
 import org.apache.seata.discovery.registry.raft.dto.LoadBalanceStrategy;
 import org.apache.seata.discovery.registry.raft.dto.TxgInfo;
 import org.apache.seata.discovery.registry.raft.dto.TxgSelectionInfo;
+import org.apache.seata.server.cluster.raft.sync.msg.dto.RaftClusterMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -283,7 +283,7 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
                                 boolean fetch = System.currentTimeMillis() - currentTime > metadataMaxAgeMs;
                                 String clusterName = CURRENT_TRANSACTION_CLUSTER_NAME;
                                 if (!fetch) {
-                                    fetch = watch();
+                                    fetch = watchTraditionalCluster();
                                 }
                                 // Cluster changes or reaches timeout refresh time
                                 if (fetch) {
@@ -840,32 +840,6 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         });
     }
 
-    /**
-     * Start TXG health check background task
-     */
-    private static void startTxgHealthCheckTask() {
-        TXG_MANAGEMENT_EXECUTOR.execute(() -> {
-            while (!CLOSED.get()) {
-                try {
-                    cleanupExpiredCacheEntries();
-                    Thread.sleep(TXG_HEALTH_CHECK_INTERVAL);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (Exception e) {
-                    LOGGER.error("Error in TXG health check task", e);
-                    try {
-                        Thread.sleep(5000); // Wait before retry
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
-            LOGGER.info("TXG health check task stopped");
-        });
-    }
-
     @Override
     public void close() {
         CLOSED.compareAndSet(false, true);
@@ -873,6 +847,77 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
 
     @Override
     public List<InetSocketAddress> aliveLookup(String transactionServiceGroup) {
+        if (isCgModeEnabled()) {
+            return aliveLookupViaCg(transactionServiceGroup);
+        } else {
+            return aliveLookupTraditional(transactionServiceGroup);
+        }
+    }
+
+    /**
+     * CG-based alive lookup
+     */
+    private static List<InetSocketAddress> aliveLookupViaCg(String transactionServiceGroup) {
+        LOGGER.debug("CG-based alive lookup for service group: {}", transactionServiceGroup);
+
+        try {
+            // Get current TXG selection for this service group
+            TxgSelectionInfo selection = getTxgSelection(transactionServiceGroup);
+
+            if (selection != null && isValidTxgSelection(selection)) {
+                // Validate that the selected TXG is still healthy
+                TxgInfo txgInfo = getCachedTxgInfo(selection.getSelectedTxgId());
+
+                if (txgInfo != null && txgInfo.isReady()) {
+                    List<InetSocketAddress> endpoints = getHealthyEndpointsFromTxg(txgInfo);
+
+                    if (CollectionUtils.isNotEmpty(endpoints)) {
+                        LOGGER.debug("CG-based alive lookup found {} healthy endpoints for service group: {}",
+                                endpoints.size(), transactionServiceGroup);
+                        return endpoints;
+                    }
+                } else {
+                    // Selected TXG is not healthy, invalidate selection
+                    LOGGER.warn("Selected TXG {} is not healthy, invalidating selection for service group: {}",
+                            selection.getSelectedTxgId(), transactionServiceGroup);
+                    invalidateTxgSelection(transactionServiceGroup);
+                }
+            }
+
+            // No valid selection or selected TXG is unhealthy, try to select a new one
+            TxgSelectionInfo newSelection = getOrSelectTxg(transactionServiceGroup);
+            if (newSelection != null && CollectionUtils.isNotEmpty(newSelection.getTransactionEndpoints())) {
+                LOGGER.info("Selected new TXG {} for service group: {}",
+                        newSelection.getSelectedTxgId(), transactionServiceGroup);
+                return newSelection.getTransactionEndpoints();
+            }
+
+        } catch (Exception e) {
+            LOGGER.error("CG-based alive lookup failed for service group: {}", transactionServiceGroup, e);
+        }
+
+        LOGGER.warn("No alive TXG endpoints found for service group: {}", transactionServiceGroup);
+        return Collections.emptyList();
+    }
+
+    /**
+     * Get healthy endpoints from TXG
+     */
+    private static List<InetSocketAddress> getHealthyEndpointsFromTxg(TxgInfo txgInfo) {
+        List<InetSocketAddress> endpoints = new ArrayList<>();
+
+        // Always include leader if healthy
+        if (txgInfo.getLeader() != null && txgInfo.isHealthy()) {
+            InetSocketAddress leaderEndpoint = txgInfo.getLeaderTransactionEndpoint();
+            if (leaderEndpoint != null) {
+                endpoints.add(leaderEndpoint);
+            }
+        }
+        // TODO: Add follower endpoints for read operations if supported?
+        return endpoints;
+    }
+
+    public List<InetSocketAddress> aliveLookupTraditional(String transactionServiceGroup) {
         if (METADATA.isRaftMode()) {
             String clusterName = getServiceGroup(transactionServiceGroup);
             Node leader = METADATA.getLeader(clusterName);
@@ -883,7 +928,172 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         return RegistryService.super.aliveLookup(transactionServiceGroup);
     }
 
+    /**
+     * Enhanced watch method that supports both traditional and CG-based watching
+     */
     private static boolean watch() throws RetryableException {
+        if (isCgModeEnabled()) {
+            return watchCgForChanges();
+        } else {
+            return watchTraditionalCluster();
+        }
+    }
+
+    /**
+     * Watch CG for TXG changes (CG-based mode)
+     */
+    private static boolean watchCgForChanges() throws RetryableException {
+        try {
+            // Collect current terms for all service groups we're interested in, not sure if this will be correct
+            Map<String, Long> serviceGroupTerms = collectServiceGroupTerms();
+
+            if (serviceGroupTerms.isEmpty()) {
+                // No service groups to watch, return false to trigger refresh?
+                return false;
+            }
+
+            // Prepare watch request for CG
+            Map<String, String> headers = createCgRequestHeaders();
+            headers.put(HTTP.CONTENT_TYPE, ContentType.APPLICATION_JSON.getMimeType());
+
+            Map<String, Object> watchRequest = new HashMap<>();
+
+            // Convert service group terms to TXG terms by looking up current selections
+            Map<String, Long> txgTerms = new HashMap<>();
+            for (Map.Entry<String, Long> entry : serviceGroupTerms.entrySet()) {
+                String serviceGroup = entry.getKey();
+                TxgSelectionInfo selection = getTxgSelection(serviceGroup);
+                if (selection != null) {
+                    TxgInfo txgInfo = getCachedTxgInfo(selection.getSelectedTxgId());
+                    if (txgInfo != null) {
+                        txgTerms.put(selection.getSelectedTxgId(), txgInfo.getTerm());
+                    }
+                }
+            }
+
+            watchRequest.put("txgTerms", txgTerms);
+
+            String cgAddress = selectHealthyCgEndpoint();
+            String requestBody = OBJECT_MAPPER.writeValueAsString(watchRequest);
+
+            LOGGER.debug("Watching CG for TXG changes: {} TXGs from {}", txgTerms.size(), cgAddress);
+
+            try (CloseableHttpResponse response = HttpClientUtil.doPost(
+                    "http://" + cgAddress + "/metadata/v1/watch/txgroups",
+                    requestBody, headers, 30000)) {
+
+                if (response != null) {
+                    StatusLine statusLine = response.getStatusLine();
+                    int statusCode = statusLine.getStatusCode();
+
+                    if (statusCode == HttpStatus.SC_UNAUTHORIZED) {
+                        handleCgAuthenticationError();
+                    } else if (statusCode == HttpStatus.SC_OK) {
+                        // Parse response to see what changed
+                        String responseBody = EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+                        handleCgWatchResponse(responseBody);
+                        return true;
+                    } else {
+                        LOGGER.debug("CG watch returned status: {}", statusCode);
+                    }
+
+                    return statusCode == HttpStatus.SC_OK;
+                }
+            }
+
+        } catch (IOException e) {
+            LOGGER.debug("CG watch request failed: {}", e.getMessage());
+            throw new RetryableException("CG watch failed", e);
+        } catch (Exception e) {
+            LOGGER.error("Unexpected error in CG watch", e);
+            throw new RetryableException("CG watch error", e);
+        }
+
+        return false;
+    }
+
+    /**
+     * Collect current terms for service groups we're watching
+     */
+    private static Map<String, Long> collectServiceGroupTerms() {
+        Map<String, Long> terms = new HashMap<>();
+
+        // Add current transaction service group
+        if (StringUtils.isNotBlank(CURRENT_TRANSACTION_SERVICE_GROUP)) {
+            TxgSelectionInfo selection = getTxgSelection(CURRENT_TRANSACTION_SERVICE_GROUP);
+            if (selection != null) {
+                TxgInfo txgInfo = getCachedTxgInfo(selection.getSelectedTxgId());
+                if (txgInfo != null) {
+                    terms.put(CURRENT_TRANSACTION_SERVICE_GROUP, txgInfo.getTerm());
+                }
+            }
+        }
+
+        // Add any other service groups from the selection cache
+        for (Map.Entry<String, TxgSelectionInfo> entry : TXG_SELECTION_CACHE.entrySet()) {
+            String serviceGroup = entry.getKey();
+            TxgSelectionInfo selection = entry.getValue();
+
+            if (!terms.containsKey(serviceGroup) && selection != null && !selection.isExpired()) {
+                TxgInfo txgInfo = getCachedTxgInfo(selection.getSelectedTxgId());
+                if (txgInfo != null) {
+                    terms.put(serviceGroup, txgInfo.getTerm());
+                }
+            }
+        }
+
+        return terms;
+    }
+
+    /**
+     * Handle CG watch response
+     */
+    private static void handleCgWatchResponse(String responseBody) {
+        try {
+            if (StringUtils.isBlank(responseBody)) {
+                return;
+            }
+
+            JsonNode rootNode = OBJECT_MAPPER.readTree(responseBody);
+
+            // Check for TXG changes
+            if (rootNode.has("changedTxgs")) {
+                JsonNode changedTxgsNode = rootNode.get("changedTxgs");
+
+                if (changedTxgsNode.isArray()) {
+                    for (JsonNode txgChangeNode : changedTxgsNode) {
+                        String txgId = txgChangeNode.get("txgId").asText();
+                        long newTerm = txgChangeNode.get("newTerm").asLong();
+
+                        LOGGER.info("CG reported TXG change: {} (term: {})", txgId, newTerm);
+
+                        // Handle the TXG change
+                        handleTxgMetadataChange(txgId, newTerm);
+                    }
+                }
+            }
+
+            // Check for service group mapping changes
+            if (rootNode.has("serviceGroupChanges")) {
+                JsonNode serviceGroupChangesNode = rootNode.get("serviceGroupChanges");
+
+                if (serviceGroupChangesNode.isArray()) {
+                    for (JsonNode changeNode : serviceGroupChangesNode) {
+                        String serviceGroup = changeNode.get("serviceGroup").asText();
+                        LOGGER.info("CG reported service group mapping change: {}", serviceGroup);
+
+                        // Invalidate selection for this service group to force re-selection
+                        invalidateTxgSelection(serviceGroup);
+                    }
+                }
+            }
+
+        } catch (JsonProcessingException e) {
+            LOGGER.error("Failed to parse CG watch response", e);
+        }
+    }
+
+    private static boolean watchTraditionalCluster() throws RetryableException {
         Map<String, String> header = new HashMap<>();
         header.put(HTTP.CONTENT_TYPE, ContentType.APPLICATION_FORM_URLENCODED.getMimeType());
         Map<String, String> param = new HashMap<>();
@@ -924,6 +1134,78 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
     @Override
     public List<InetSocketAddress> refreshAliveLookup(
             String transactionServiceGroup, List<InetSocketAddress> aliveAddress) {
+        if (isCgModeEnabled()) {
+            return refreshAliveLookupViaCg(transactionServiceGroup, aliveAddress);
+        } else {
+            return refreshAliveLookupTraditional(transactionServiceGroup, aliveAddress);
+        }
+    }
+
+    /**
+     * CG-based refresh alive lookup
+     */
+    private static List<InetSocketAddress> refreshAliveLookupViaCg(
+            String transactionServiceGroup, List<InetSocketAddress> aliveAddress) {
+
+        LOGGER.debug("Refreshing alive lookup via CG for service group: {}", transactionServiceGroup);
+
+        try {
+            // Get current TXG selection
+            TxgSelectionInfo selection = getTxgSelection(transactionServiceGroup);
+
+            if (selection != null) {
+                String selectedTxgId = selection.getSelectedTxgId();
+
+                // Refresh TXG metadata to get latest health status
+                TxgInfo refreshedTxgInfo = getValidatedTxgInfo(selectedTxgId);
+
+                if (refreshedTxgInfo != null) {
+                    // Update health status based on alive addresses
+                    boolean isHealthy = updateTxgHealthFromAliveAddresses(refreshedTxgInfo, aliveAddress);
+
+                    if (isHealthy) {
+                        // TXG is healthy, filter alive addresses to only include the leader
+                        List<InetSocketAddress> filteredAddresses = filterAddressesForTxg(
+                                refreshedTxgInfo, aliveAddress);
+
+                        // Update cache and return filtered addresses
+                        ALIVE_NODES.put(transactionServiceGroup, filteredAddresses);
+
+                        LOGGER.debug("Updated alive addresses for service group {}: {} addresses",
+                                transactionServiceGroup, filteredAddresses.size());
+                        return filteredAddresses;
+                    } else {
+                        // TXG is unhealthy, invalidate selection and try to select new one
+                        LOGGER.warn("TXG {} is unhealthy, invalidating selection for service group: {}",
+                                selectedTxgId, transactionServiceGroup);
+
+                        invalidateTxgSelection(transactionServiceGroup);
+                        refreshedTxgInfo.setHealthy(false);
+
+                        // Try to select a new healthy TXG
+                        TxgSelectionInfo newSelection = getOrSelectTxg(transactionServiceGroup);
+                        if (newSelection != null) {
+                            LOGGER.info("Selected new healthy TXG {} for service group: {}",
+                                    newSelection.getSelectedTxgId(), transactionServiceGroup);
+                            return newSelection.getTransactionEndpoints();
+                        }
+                    }
+                }
+            }
+
+            // No valid TXG selection, return empty list
+            ALIVE_NODES.put(transactionServiceGroup, Collections.emptyList());
+            return Collections.emptyList();
+
+        } catch (Exception e) {
+            LOGGER.error("Error refreshing alive lookup for service group: {}", transactionServiceGroup, e);
+            ALIVE_NODES.put(transactionServiceGroup, Collections.emptyList());
+            return Collections.emptyList();
+        }
+    }
+
+    public List<InetSocketAddress> refreshAliveLookupTraditional(
+            String transactionServiceGroup, List<InetSocketAddress> aliveAddress) {
         if (METADATA.isRaftMode()) {
             Node leader = METADATA.getLeader(getServiceGroup(transactionServiceGroup));
             InetSocketAddress leaderAddress = selectTransactionEndpoint(leader);
@@ -947,6 +1229,119 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         } else {
             return RegistryService.super.refreshAliveLookup(transactionServiceGroup, aliveAddress);
         }
+    }
+
+    /**
+     * Update TXG health status based on alive addresses
+     */
+    private static boolean updateTxgHealthFromAliveAddresses(TxgInfo txgInfo, List<InetSocketAddress> aliveAddresses) {
+        if (txgInfo == null || CollectionUtils.isEmpty(aliveAddresses)) {
+            return false;
+        }
+
+        // Check if TXG leader endpoint is in alive addresses
+        InetSocketAddress leaderEndpoint = txgInfo.getLeaderTransactionEndpoint();
+        if (leaderEndpoint == null) {
+            return false;
+        }
+
+        boolean leaderAlive = aliveAddresses.contains(leaderEndpoint);
+
+        // Update health status
+        txgInfo.setHealthy(leaderAlive);
+        updateTxgHealthStatus(txgInfo.getTxgId(), leaderAlive);
+
+        if (!leaderAlive) {
+            LOGGER.warn("TXG {} leader is not alive: {}", txgInfo.getTxgId(), leaderEndpoint);
+        }
+
+        return leaderAlive;
+    }
+
+    /**
+     * Filter alive addresses to only include addresses from the selected TXG
+     */
+    private static List<InetSocketAddress> filterAddressesForTxg(
+            TxgInfo txgInfo, List<InetSocketAddress> aliveAddresses) {
+
+        if (txgInfo == null || CollectionUtils.isEmpty(aliveAddresses)) {
+            return Collections.emptyList();
+        }
+
+        Set<InetSocketAddress> txgEndpoints = new HashSet<>();
+
+        // Add leader endpoint
+        InetSocketAddress leaderEndpoint = txgInfo.getLeaderTransactionEndpoint();
+        if (leaderEndpoint != null) {
+            txgEndpoints.add(leaderEndpoint);
+        }
+
+        // TODO: Add follower endpoints if read operations are supported?
+        return aliveAddresses.stream()
+                .filter(txgEndpoints::contains)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Handle TXG health check results
+     */
+    private static void processTxgHealthCheckResults() {
+        if (!isCgModeEnabled()) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long healthCheckThreshold = now - TXG_HEALTH_CHECK_INTERVAL;
+
+        // Check each cached TXG
+        for (Map.Entry<String, TxgInfo> entry : TXG_CACHE.entrySet()) {
+            String txgId = entry.getKey();
+            TxgInfo txgInfo = entry.getValue();
+
+            Long lastHealthCheck = TXG_HEALTH_STATUS.get(txgId);
+            boolean wasHealthy = txgInfo.isHealthy();
+
+            // Mark as unhealthy if no recent health check
+            boolean isHealthy = lastHealthCheck != null && lastHealthCheck > healthCheckThreshold;
+
+            if (wasHealthy != isHealthy) {
+                txgInfo.setHealthy(isHealthy);
+
+                LOGGER.info("TXG {} health status changed: {} -> {}", txgId, wasHealthy, isHealthy);
+
+                if (!isHealthy) {
+                    // Invalidate any selections using this unhealthy TXG
+                    invalidateTxgSelectionForTxg(txgId);
+                }
+            }
+        }
+    }
+
+    /**
+     * Update the existing startTxgHealthCheckTask to include health processing
+     */
+    private static void startTxgHealthCheckTask() {
+        TXG_MANAGEMENT_EXECUTOR.execute(() -> {
+            while (!CLOSED.get()) {
+                try {
+                    cleanupExpiredCacheEntries();
+                    processTxgHealthCheckResults(); // Added health check processing
+                    Thread.sleep(TXG_HEALTH_CHECK_INTERVAL);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    LOGGER.error("Error in TXG health check task", e);
+                    try {
+                        Thread.sleep(5000); // Wait before retry
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+            LOGGER.info("TXG health check task stopped");
+        });
     }
 
     private static void acquireClusterMetaDataByClusterName(String clusterName) {
@@ -1048,8 +1443,70 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         if (clusterName == null) {
             return null;
         }
+
         CURRENT_TRANSACTION_SERVICE_GROUP = key;
         CURRENT_TRANSACTION_CLUSTER_NAME = clusterName;
+
+        // CG-based discovery flow
+        if (isCgModeEnabled()) {
+            return lookupViaCg(key, clusterName);
+        } else {
+            // Traditional single-raft discovery flow
+            return lookupTraditional(key, clusterName);
+        }
+    }
+
+    /**
+     * CG-based lookup flow
+     */
+    private static List<InetSocketAddress> lookupViaCg(String serviceGroup, String clusterName) throws Exception {
+        LOGGER.debug("Using CG-based lookup for service group: {}", serviceGroup);
+
+        try {
+            // Check if we have TXG information cached
+            if (!hasCachedTxgInfoForServiceGroup(serviceGroup)) {
+                LOGGER.debug("No cached TXG info for service group {}, initializing from CG", serviceGroup);
+                initializeTxgCacheForServiceGroup(serviceGroup);
+            }
+
+            // Get TXG endpoints using load balancing
+            List<InetSocketAddress> endpoints = getTxgEndpointsForServiceGroup(serviceGroup);
+
+            if (CollectionUtils.isNotEmpty(endpoints)) {
+                // Start TXG monitoring if not already started
+                if (!isMetadataRefreshActive()) {
+                    startCgBasedMetadataRefresh();
+                }
+
+                LOGGER.info("CG-based lookup successful for service group {}: {} endpoints",
+                        serviceGroup, endpoints.size());
+                return endpoints;
+            } else {
+                LOGGER.warn("No TXG endpoints available for service group: {}", serviceGroup);
+
+                // Fallback: try direct CG query
+                return fallbackDirectCgQuery(serviceGroup);
+            }
+
+        } catch (Exception e) {
+            LOGGER.error("CG-based lookup failed for service group: {}", serviceGroup, e);
+
+            // If CG lookup fails completely, could fallback to traditional mode if configured
+            if (shouldFallbackToTraditional()) {
+                LOGGER.warn("Falling back to traditional lookup for service group: {}", serviceGroup);
+                return lookupTraditional(serviceGroup, clusterName);
+            }
+
+            throw new Exception("Service discovery failed for service group: " + serviceGroup, e);
+        }
+    }
+
+    /**
+     * Traditional single-raft lookup flow (existing logic)
+     */
+    private static List<InetSocketAddress> lookupTraditional(String serviceGroup, String clusterName) throws Exception {
+        LOGGER.debug("Using traditional lookup for service group: {}", serviceGroup);
+
         if (!METADATA.containsGroup(clusterName)) {
             String raftClusterAddress = CONFIG.getConfig(getRaftAddrFileKey());
             if (StringUtils.isNotBlank(raftClusterAddress)) {
@@ -1067,7 +1524,7 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
                 INIT_ADDRESSES.put(clusterName, list);
                 // init jwt token
                 try {
-                    refreshToken(queryHttpAddress(clusterName, key));
+                    refreshToken(queryHttpAddress(clusterName, serviceGroup));
                 } catch (Exception e) {
                     throw new RuntimeException("Init fetch token failed!", e);
                 }
@@ -1076,6 +1533,7 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
                 startQueryMetadata();
             }
         }
+
         List<Node> nodes = METADATA.getNodes(clusterName);
         if (CollectionUtils.isNotEmpty(nodes)) {
             return nodes.parallelStream()
@@ -1084,6 +1542,166 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         }
         return Collections.emptyList();
     }
+
+    /**
+     * Check if we have cached TXG information for service group
+     */
+    private static boolean hasCachedTxgInfoForServiceGroup(String serviceGroup) {
+        List<String> txgIds = getAvailableTxgsForServiceGroup(serviceGroup);
+        if (CollectionUtils.isEmpty(txgIds)) {
+            return false;
+        }
+
+        // Check if at least one TXG has valid cached info
+        return txgIds.stream().anyMatch(txgId -> {
+            TxgInfo info = getCachedTxgInfo(txgId);
+            return info != null && info.isReady();
+        });
+    }
+
+    /**
+     * Fallback direct CG query when cached data is unavailable
+     */
+    private static List<InetSocketAddress> fallbackDirectCgQuery(String serviceGroup) {
+        try {
+            LOGGER.debug("Attempting direct CG query fallback for service group: {}", serviceGroup);
+
+            // Force refresh from CG
+            List<String> txgIds = discoverTxgsForServiceGroup(serviceGroup);
+            if (CollectionUtils.isNotEmpty(txgIds)) {
+                // Try to get at least one healthy TXG
+                for (String txgId : txgIds) {
+                    try {
+                        TxgInfo txgInfo = getTxgMetadataFromCg(txgId);
+                        if (txgInfo != null && txgInfo.isReady()) {
+                            cacheTxgInfo(txgId, txgInfo);
+                            InetSocketAddress endpoint = txgInfo.getLeaderTransactionEndpoint();
+                            if (endpoint != null) {
+                                LOGGER.info("Fallback CG query successful for service group {}: {}",
+                                        serviceGroup, endpoint);
+                                return Collections.singletonList(endpoint);
+                            }
+                        }
+                    } catch (Exception e) {
+                        LOGGER.warn("Failed to query TXG {} in fallback", txgId, e);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("Fallback direct CG query failed for service group: {}", serviceGroup, e);
+        }
+
+        return Collections.emptyList();
+    }
+
+    /**
+     * Check if should fallback to traditional mode on CG failure
+     */
+    private static boolean shouldFallbackToTraditional() {
+        // Check if traditional mode addresses are configured as backup
+        String traditionalAddress = CONFIG.getConfig(getRaftAddrFileKey());
+        return StringUtils.isNotBlank(traditionalAddress);
+    }
+
+    /**
+     * Check if metadata refresh is active
+     */
+    private static boolean isMetadataRefreshActive() {
+        return TXG_MANAGEMENT_EXECUTOR != null && !TXG_MANAGEMENT_EXECUTOR.isShutdown();
+    }
+
+    /**
+     * Start CG-based metadata refresh
+     */
+    private static void startCgBasedMetadataRefresh() {
+        if (REFRESH_METADATA_EXECUTOR == null) {
+            synchronized (INIT_ADDRESSES) {
+                if (REFRESH_METADATA_EXECUTOR == null) {
+                    REFRESH_METADATA_EXECUTOR = new ThreadPoolExecutor(
+                            1,
+                            1,
+                            0L,
+                            TimeUnit.MILLISECONDS,
+                            new LinkedBlockingQueue<>(),
+                            new NamedThreadFactory("cgMetadataRefresh", 1, true));
+
+                    REFRESH_METADATA_EXECUTOR.execute(() -> {
+                        LOGGER.info("Starting CG-based metadata refresh loop");
+
+                        while (!CLOSED.get()) {
+                            try {
+                                // Check for TXG changes via CG watch
+                                boolean hasChanges = watchForCgTxgChanges();
+
+                                // Force refresh if cache is stale
+                                if (hasChanges || isTxgCacheStale()) {
+                                    refreshTxgCacheFromCg();
+                                }
+
+                                Thread.sleep(Math.min(CG_DISCOVERY_INTERVAL, 10000)); // Max 10s sleep
+
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            } catch (Exception e) {
+                                LOGGER.error("Error in CG metadata refresh loop", e);
+                                try {
+                                    Thread.sleep(5000); // Wait before retry
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                    break;
+                                }
+                            }
+                        }
+
+                        LOGGER.info("CG-based metadata refresh loop stopped");
+                    });
+
+                    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                        CLOSED.compareAndSet(false, true);
+                        if (REFRESH_METADATA_EXECUTOR != null) {
+                            REFRESH_METADATA_EXECUTOR.shutdown();
+                        }
+                    }));
+                }
+            }
+        }
+    }
+
+    /**
+     * Watch for TXG changes via CG
+     */
+    private static boolean watchForCgTxgChanges() {
+        if (!isCgModeEnabled()) {
+            return false;
+        }
+
+        try {
+            // Collect current terms for all cached TXGs
+            Map<String, Long> txgTerms = TXG_CACHE.entrySet().stream()
+                    .collect(Collectors.toMap(
+                            Map.Entry::getKey,
+                            entry -> entry.getValue().getTerm()
+                    ));
+
+            if (txgTerms.isEmpty()) {
+                // No cached TXGs to watch
+                return false;
+            }
+
+            // Watch for changes
+            return watchCgForTxgChanges(txgTerms);
+
+        } catch (RetryableException e) {
+            LOGGER.debug("CG watch request failed (will retry): {}", e.getMessage());
+            return false;
+        } catch (Exception e) {
+            LOGGER.error("Unexpected error in CG watch", e);
+            return false;
+        }
+    }
+
+
 
     private static String getMetadataMaxAgeMs() {
         return String.join(
@@ -1888,37 +2506,6 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
     }
 
     /**
-     * Handle TXG metadata change notification from CG
-     */
-    private static void handleTxgMetadataChange(String txgId, long newTerm) {
-        LOGGER.info("Received TXG metadata change notification: {} (term: {})", txgId, newTerm);
-
-        // Invalidate cached TXG info
-        TxgInfo cachedInfo = TXG_CACHE.get(txgId);
-        if (cachedInfo != null && cachedInfo.getTerm() < newTerm) {
-            // Refresh TXG metadata from CG
-            try {
-                TxgInfo updatedInfo = getTxgMetadataFromCg(txgId);
-                if (updatedInfo != null) {
-                    cacheTxgInfo(txgId, updatedInfo);
-
-                    // Invalidate selections that use this TXG
-                    invalidateTxgSelectionForTxg(txgId);
-
-                    LOGGER.info("Updated TXG metadata for: {} (new term: {})", txgId, updatedInfo.getTerm());
-                }
-            } catch (Exception e) {
-                LOGGER.error("Failed to refresh TXG metadata after change notification: {}", txgId, e);
-                // Mark as unhealthy if we can't refresh
-                if (cachedInfo != null) {
-                    cachedInfo.setHealthy(false);
-                    invalidateTxgSelectionForTxg(txgId);
-                }
-            }
-        }
-    }
-
-    /**
      * Get cache statistics for monitoring
      */
     private static Map<String, Object> getTxgCacheStatistics() {
@@ -1931,5 +2518,213 @@ public class RaftRegistryServiceImpl implements RegistryService<ConfigChangeList
         stats.put("cacheAge", System.currentTimeMillis() - TXG_CACHE_LAST_UPDATE);
 
         return stats;
+    }
+
+    /**
+     * TXG node pushes metadata changes to CG
+     * This method should be called by TXG nodes when their metadata changes
+     */
+    public static void pushTxgMetadataChangeToCg(String txgId, RaftClusterMetadata newMetadata) {
+        if (!isCgModeEnabled()) {
+            return;
+        }
+
+        try {
+            LOGGER.info("Pushing TXG metadata change to CG: {} (term: {})", txgId, newMetadata.getTerm());
+
+            String cgAddress = selectHealthyCgEndpoint();
+            Map<String, String> headers = createCgRequestHeaders();
+            headers.put(HTTP.CONTENT_TYPE, ContentType.APPLICATION_JSON.getMimeType());
+
+            // Create the metadata update request
+            Map<String, Object> updateRequest = new HashMap<>();
+            updateRequest.put("txgId", txgId);
+            updateRequest.put("term", newMetadata.getTerm());
+            updateRequest.put("timestamp", System.currentTimeMillis());
+
+            // Add leader information
+            if (newMetadata.getLeader() != null) {
+                updateRequest.put("leader", nodeToJsonMap(newMetadata.getLeader()));
+            }
+
+            // Add follower information
+            if (newMetadata.getFollowers() != null) {
+                List<Map<String, Object>> followers = newMetadata.getFollowers().stream()
+                        .map(RaftRegistryServiceImpl::nodeToJsonMap)
+                        .collect(Collectors.toList());
+                updateRequest.put("followers", followers);
+            }
+
+            // Add learner information
+            if (newMetadata.getLearner() != null) {
+                List<Map<String, Object>> learners = newMetadata.getLearner().stream()
+                        .map(RaftRegistryServiceImpl::nodeToJsonMap)
+                        .collect(Collectors.toList());
+                updateRequest.put("learners", learners);
+            }
+
+            String requestBody = OBJECT_MAPPER.writeValueAsString(updateRequest);
+
+            try (CloseableHttpResponse response = HttpClientUtil.doPost(
+                    "http://" + cgAddress + "/metadata/v1/txgroups/update",
+                    requestBody, headers, 5000)) {
+
+                if (response != null) {
+                    int statusCode = response.getStatusLine().getStatusCode();
+                    if (statusCode == HttpStatus.SC_OK) {
+                        LOGGER.info("Successfully pushed TXG metadata change to CG: {}", txgId);
+                    } else {
+                        LOGGER.warn("Failed to push TXG metadata to CG: {} (status: {})", txgId, statusCode);
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            LOGGER.error("Failed to push TXG metadata change to CG: {}", txgId, e);
+        }
+    }
+
+    /**
+     * Convert Node to JSON-compatible map
+     */
+    private static Map<String, Object> nodeToJsonMap(Node node) {
+        Map<String, Object> nodeMap = new HashMap<>();
+
+        if (node.getTransaction() != null) {
+            Map<String, Object> transaction = new HashMap<>();
+            transaction.put("host", node.getTransaction().getHost());
+            transaction.put("port", node.getTransaction().getPort());
+            nodeMap.put("transaction", transaction);
+        }
+
+        if (node.getControl() != null) {
+            Map<String, Object> control = new HashMap<>();
+            control.put("host", node.getControl().getHost());
+            control.put("port", node.getControl().getPort());
+            nodeMap.put("control", control);
+        }
+
+        if (node.getInternal() != null) {
+            Map<String, Object> internal = new HashMap<>();
+            internal.put("host", node.getInternal().getHost());
+            internal.put("port", node.getInternal().getPort());
+            nodeMap.put("internal", internal);
+        }
+
+        if (node.getGroup() != null) {
+            nodeMap.put("group", node.getGroup());
+        }
+
+        if (node.getVersion() != null) {
+            nodeMap.put("version", node.getVersion());
+        }
+
+        if (node.getMetadata() != null) {
+            nodeMap.put("metadata", node.getMetadata());
+        }
+
+        return nodeMap;
+    }
+
+    /**
+     * Enhanced TXG metadata change handler with client notification
+     */
+    private static void handleTxgMetadataChange(String txgId, long newTerm) {
+        LOGGER.info("Processing TXG metadata change: {} (term: {})", txgId, newTerm);
+
+        try {
+            // Check if we have this TXG cached
+            TxgInfo cachedInfo = getCachedTxgInfo(txgId);
+
+            if (cachedInfo != null && cachedInfo.getTerm() >= newTerm) {
+                LOGGER.debug("Ignoring stale TXG metadata change: {} (cached_term: {}, new_term: {})",
+                        txgId, cachedInfo.getTerm(), newTerm);
+                return;
+            }
+
+            // Fetch updated metadata from CG
+            TxgInfo updatedInfo = getTxgMetadataFromCg(txgId);
+
+            if (updatedInfo != null) {
+                // Update cache
+                cacheTxgInfo(txgId, updatedInfo);
+
+                // Check if this TXG is selected by any service groups
+                List<String> affectedServiceGroups = findServiceGroupsUsingTxg(txgId);
+
+                for (String serviceGroup : affectedServiceGroups) {
+                    TxgSelectionInfo selection = getTxgSelection(serviceGroup);
+
+                    if (selection != null && txgId.equals(selection.getSelectedTxgId())) {
+                        if (updatedInfo.isReady()) {
+                            // TXG is still healthy, update endpoints
+                            List<InetSocketAddress> newEndpoints = Collections.singletonList(
+                                    updatedInfo.getLeaderTransactionEndpoint());
+
+                            selection.setTransactionEndpoints(newEndpoints);
+                            cacheTxgSelection(serviceGroup, selection);
+
+                            LOGGER.info("Updated endpoints for service group {} after TXG change: {}",
+                                    serviceGroup, newEndpoints);
+                        } else {
+                            // TXG is not ready, invalidate selection
+                            invalidateTxgSelection(serviceGroup);
+
+                            LOGGER.warn("Invalidated selection for service group {} due to unhealthy TXG: {}",
+                                    serviceGroup, txgId);
+                        }
+                    }
+                }
+
+                // Notify any local listeners (if needed)
+                notifyLocalTxgChangeListeners(txgId, newTerm, updatedInfo);
+
+            } else {
+                LOGGER.error("Failed to fetch updated TXG metadata from CG: {}", txgId);
+
+                // Mark cached TXG as potentially unhealthy
+                if (cachedInfo != null) {
+                    cachedInfo.setHealthy(false);
+                    updateTxgHealthStatus(txgId, false);
+                    invalidateTxgSelectionForTxg(txgId);
+                }
+            }
+
+        } catch (Exception e) {
+            LOGGER.error("Error handling TXG metadata change: {}", txgId, e);
+        }
+    }
+
+    /**
+     * Find service groups that are currently using the specified TXG
+     */
+    private static List<String> findServiceGroupsUsingTxg(String txgId) {
+        return TXG_SELECTION_CACHE.entrySet().stream()
+                .filter(entry -> {
+                    TxgSelectionInfo selection = entry.getValue();
+                    return selection != null &&
+                            !selection.isExpired() &&
+                            txgId.equals(selection.getSelectedTxgId());
+                })
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Notify local TXG change listeners
+     */
+    private static void notifyLocalTxgChangeListeners(String txgId, long newTerm, TxgInfo updatedInfo) {
+        // This is a hook for any local listeners that need to be notified of TXG changes
+        // For example, connection pools, caches, etc.
+
+        LOGGER.debug("Notifying local listeners of TXG change: {} (term: {})", txgId, newTerm);
+
+        // Example: Update connection health status
+        updateTxgHealthStatus(txgId, updatedInfo.isHealthy());
+
+        // Example: Log metrics or trigger monitoring alerts
+        if (!updatedInfo.isHealthy()) {
+            LOGGER.warn("TXG {} is now unhealthy after metadata change", txgId);
+        }
     }
 }
