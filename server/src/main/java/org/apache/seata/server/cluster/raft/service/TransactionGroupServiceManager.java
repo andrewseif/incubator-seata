@@ -108,8 +108,7 @@ public class TransactionGroupServiceManager implements RaftGroupStoreManager {
     @Override
     public Map<String, List<Node>> getRaftGroupsByIp(String ip) {
         if (isCGMember()) {
-            // todo: If this API is provided for use by the frontend interface or for queries by operations personnel,
-            // it needs to be forwarded to the CG node for querying.
+            throw new UnsupportedOperationException("Forwarding to CG node for querying is not implemented.");
         }
         if (ip == null || ip.trim().isEmpty()) {
             throw new IllegalArgumentException("IP address cannot be null or empty");
@@ -148,8 +147,7 @@ public class TransactionGroupServiceManager implements RaftGroupStoreManager {
         validatePeerParameters(ip, port);
         validateGroupExists(group);
 
-        // todo: You need to follow the approach used in changePeersForGroup and submit it to the state machine for
-        // execution.
+
         try {
             PeerId newPeer = new PeerId(ip, port);
             RouteTable routeTable = RouteTable.getInstance();
@@ -187,8 +185,6 @@ public class TransactionGroupServiceManager implements RaftGroupStoreManager {
         validateControlGroupPermission();
         validateGroupExists(group);
         validatePeerParameters(ip, port);
-        // todo: You need to follow the approach used in changePeersForGroup and submit it to the state machine for
-        // execution.
         try {
             PeerId peerToRemove = new PeerId(ip, port);
             RouteTable routeTable = RouteTable.getInstance();
