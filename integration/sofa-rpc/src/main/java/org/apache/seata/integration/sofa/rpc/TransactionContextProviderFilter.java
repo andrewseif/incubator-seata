@@ -50,23 +50,33 @@ public class TransactionContextProviderFilter extends Filter {
         String rpcXid = getRpcXid(sofaRequest);
         BranchType branchType = RootContext.getBranchType();
         String rpcBranchType = getBranchType(sofaRequest);
+        String txg = RootContext.getTXG();
+        String rpcTxg = getTxg(sofaRequest);
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug(
-                    "context in RootContext[{},{}], context in RpcContext[{},{}]",
+                    "context in RootContext[{},{},{}], context in RpcContext[{},{},{}]",
                     xid,
                     branchType,
+                    txg,
                     rpcXid,
-                    rpcBranchType);
+                    rpcBranchType,
+                    rpcTxg);
         }
         boolean bind = false;
         if (xid != null) {
             RpcInternalContext.getContext().setAttachment(RootContext.HIDDEN_KEY_XID, xid);
             RpcInternalContext.getContext().setAttachment(RootContext.HIDDEN_KEY_BRANCH_TYPE, branchType.name());
+            if (txg != null) {
+                RpcInternalContext.getContext().setAttachment(RootContext.KEY_TXG, txg);
+            }
         } else {
             if (null != rpcXid) {
                 RootContext.bind(rpcXid);
                 if (StringUtils.equals(BranchType.TCC.name(), rpcBranchType)) {
                     RootContext.bindBranchType(BranchType.TCC);
+                }
+                if (rpcTxg != null) {
+                    RootContext.bindTXG(rpcTxg);
                 }
                 bind = true;
                 if (LOGGER.isDebugEnabled()) {
@@ -80,6 +90,7 @@ public class TransactionContextProviderFilter extends Filter {
             if (xid != null) {
                 RpcInternalContext.getContext().removeAttachment(RootContext.HIDDEN_KEY_XID);
                 RpcInternalContext.getContext().removeAttachment(RootContext.HIDDEN_KEY_BRANCH_TYPE);
+                RpcInternalContext.getContext().removeAttachment(RootContext.KEY_TXG);
             }
             if (bind) {
                 String unbindXid = RootContext.unbind();
@@ -90,6 +101,7 @@ public class TransactionContextProviderFilter extends Filter {
                 if (BranchType.TCC == previousBranchType) {
                     RootContext.unbindBranchType();
                 }
+                RootContext.unbindTXG();
                 if (!rpcXid.equalsIgnoreCase(unbindXid)) {
                     if (LOGGER.isWarnEnabled()) {
                         LOGGER.warn("xid in change during RPC from [{}] to [{}]", rpcXid, unbindXid);
@@ -102,6 +114,10 @@ public class TransactionContextProviderFilter extends Filter {
                         if (BranchType.TCC == previousBranchType) {
                             RootContext.bindBranchType(BranchType.TCC);
                             LOGGER.warn("bind branchType [{}] back to RootContext", previousBranchType);
+                        }
+                        if (rpcTxg != null) {
+                            RootContext.bindTXG(rpcTxg);
+                            LOGGER.warn("bind txg [{}] back to RootContext", rpcTxg);
                         }
                     }
                 }
@@ -123,5 +139,14 @@ public class TransactionContextProviderFilter extends Filter {
 
     private String getBranchType(SofaRequest sofaRequest) {
         return (String) sofaRequest.getRequestProp(RootContext.KEY_BRANCH_TYPE);
+    }
+
+    /**
+     * get rpc txg
+     * @param sofaRequest
+     * @return
+     */
+    private String getTxg(SofaRequest sofaRequest) {
+        return (String) sofaRequest.getRequestProp(RootContext.KEY_TXG);
     }
 }

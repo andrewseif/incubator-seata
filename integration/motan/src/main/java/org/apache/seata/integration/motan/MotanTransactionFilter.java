@@ -45,23 +45,33 @@ public class MotanTransactionFilter implements Filter {
         BranchType branchType = RootContext.getBranchType();
         String requestXid = getRpcXid(request);
         String rpcBranchType = getBranchType(request);
+        String currentTxg = RootContext.getTXG();
+        String requestTxg = getTxg(request);
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug(
-                    "context in RootContext[{},{}], context in RpcContext[{},{}]",
+                    "context in RootContext[{},{},{}], context in RpcContext[{},{},{}]",
                     currentXid,
                     branchType,
+                    currentTxg,
                     requestXid,
-                    rpcBranchType);
+                    rpcBranchType,
+                    requestTxg);
         }
         boolean bind = false;
         if (currentXid != null) {
             request.getAttachments().put(RootContext.KEY_XID, currentXid);
             request.getAttachments().put(RootContext.KEY_BRANCH_TYPE, branchType.name());
+            if (currentTxg != null) {
+                request.getAttachments().put(RootContext.KEY_TXG, currentTxg);
+            }
 
         } else if (requestXid != null) {
             RootContext.bind(requestXid);
             if (StringUtils.equals(BranchType.TCC.name(), rpcBranchType)) {
                 RootContext.bindBranchType(BranchType.TCC);
+            }
+            if (requestTxg != null) {
+                RootContext.bindTXG(requestTxg);
             }
             bind = true;
             if (LOGGER.isDebugEnabled()) {
@@ -77,6 +87,7 @@ public class MotanTransactionFilter implements Filter {
                 if (BranchType.TCC == previousBranchType) {
                     RootContext.unbindBranchType();
                 }
+                RootContext.unbindTXG();
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug("unbind xid [{}] branchType [{}] from RootContext", unbindXid, previousBranchType);
                 }
@@ -88,6 +99,10 @@ public class MotanTransactionFilter implements Filter {
                         if (BranchType.TCC == previousBranchType) {
                             RootContext.bindBranchType(BranchType.TCC);
                             LOGGER.warn("bind branchType [{}] back to RootContext", previousBranchType);
+                        }
+                        if (requestTxg != null) {
+                            RootContext.bindTXG(requestTxg);
+                            LOGGER.warn("bind txg [{}] back to RootContext", requestTxg);
                         }
                     }
                 }
@@ -110,5 +125,13 @@ public class MotanTransactionFilter implements Filter {
 
     private String getBranchType(Request request) {
         return request.getAttachments().get(RootContext.KEY_BRANCH_TYPE);
+    }
+    /**
+     * get rpc txg
+     * @param request
+     * @return
+     */
+    private String getTxg(Request request) {
+        return request.getAttachments().get(RootContext.KEY_TXG);
     }
 }

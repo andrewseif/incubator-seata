@@ -50,23 +50,33 @@ public class TransactionContextConsumerFilter extends Filter {
         String rpcXid = getRpcXid();
         BranchType branchType = RootContext.getBranchType();
         String rpcBranchType = getBranchType();
+        String txg = RootContext.getTXG();
+        String rpcTxg = getTxg();
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug(
-                    "context in RootContext[{},{}], context in RpcContext[{},{}]",
+                    "context in RootContext[{},{},{}], context in RpcContext[{},{},{}]",
                     xid,
                     branchType,
+                    txg,
                     rpcXid,
-                    rpcBranchType);
+                    rpcBranchType,
+                    rpcTxg);
         }
         boolean bind = false;
         if (xid != null) {
             sofaRequest.addRequestProp(RootContext.KEY_XID, xid);
             sofaRequest.addRequestProp(RootContext.KEY_BRANCH_TYPE, branchType.name());
+            if (txg != null) {
+                sofaRequest.addRequestProp(RootContext.KEY_TXG, txg);
+            }
         } else {
             if (rpcXid != null) {
                 RootContext.bind(rpcXid);
                 if (StringUtils.equals(BranchType.TCC.name(), rpcBranchType)) {
                     RootContext.bindBranchType(BranchType.TCC);
+                }
+                if (rpcTxg != null) {
+                    RootContext.bindTXG(rpcTxg);
                 }
                 bind = true;
                 if (LOGGER.isDebugEnabled()) {
@@ -86,6 +96,7 @@ public class TransactionContextConsumerFilter extends Filter {
                 if (BranchType.TCC == previousBranchType) {
                     RootContext.unbindBranchType();
                 }
+                RootContext.unbindTXG();
                 if (!rpcXid.equalsIgnoreCase(unbindXid)) {
                     if (LOGGER.isWarnEnabled()) {
                         LOGGER.warn("xid in change during RPC from [{}] to [{}]", rpcXid, unbindXid);
@@ -98,6 +109,10 @@ public class TransactionContextConsumerFilter extends Filter {
                         if (BranchType.TCC == previousBranchType) {
                             RootContext.bindBranchType(BranchType.TCC);
                             LOGGER.warn("bind branchType [{}] back to RootContext", previousBranchType);
+                        }
+                        if (rpcTxg != null) {
+                            RootContext.bindTXG(rpcTxg);
+                            LOGGER.warn("bind txg [{}] back to RootContext", rpcTxg);
                         }
                     }
                 }
@@ -119,5 +134,13 @@ public class TransactionContextConsumerFilter extends Filter {
 
     private String getBranchType() {
         return (String) RpcInternalContext.getContext().getAttachment(RootContext.HIDDEN_KEY_BRANCH_TYPE);
+    }
+
+    /**
+     * get rpc txg
+     * @return
+     */
+    private String getTxg() {
+        return (String) RpcInternalContext.getContext().getAttachment(RootContext.KEY_TXG);
     }
 }
