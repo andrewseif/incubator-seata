@@ -28,4 +28,7 @@ public interface GrpcHeaderKey {
 
     Metadata.Key<String> BRANCH_HEADER_KEY =
             Metadata.Key.of(RootContext.KEY_BRANCH_TYPE, Metadata.ASCII_STRING_MARSHALLER);
+
+    Metadata.Key<String> TXG_HEADER_KEY =
+            Metadata.Key.of(RootContext.KEY_TXG, Metadata.ASCII_STRING_MARSHALLER);
 }

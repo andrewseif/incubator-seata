@@ -43,6 +43,12 @@ public interface ConsumerRpcFilter<T> extends BaseRpcFilter<T> {
                                 RootContext.KEY_BRANCH_TYPE,
                                 RootContext.getBranchType().name());
                         break;
+                    case RootContext.KEY_TXG:
+                        String txg = RootContext.getTXG();
+                        if (StringUtils.isNotBlank(txg)) {
+                            contextMap.put(RootContext.KEY_TXG, txg);
+                        }
+                        break;
                     default:
                         throw new IllegalArgumentException("wrong context: " + TRX_CONTEXT_KEYS[i]);
                 }

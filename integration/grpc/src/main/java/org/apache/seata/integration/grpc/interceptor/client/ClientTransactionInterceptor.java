@@ -43,6 +43,10 @@ public class ClientTransactionInterceptor implements ClientInterceptor {
                     headers.put(
                             GrpcHeaderKey.BRANCH_HEADER_KEY,
                             RootContext.getBranchType().name());
+                    String txg = RootContext.getTXG();
+                    if (txg != null) {
+                        headers.put(GrpcHeaderKey.TXG_HEADER_KEY, txg);
+                    }
                 }
                 super.start(
                         new ForwardingClientCallListener.SimpleForwardingClientCallListener<RespT>(responseListener) {

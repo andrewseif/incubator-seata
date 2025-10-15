@@ -30,7 +30,8 @@ public class JakartaTransactionPropagationInterceptor extends TransactionPropaga
             jakarta.servlet.http.HttpServletResponse response,
             Object handler) {
         String rpcXid = request.getHeader(RootContext.KEY_XID);
-        return this.bindXid(rpcXid);
+        String rpcTxg = request.getHeader(RootContext.KEY_TXG);
+        return this.bindXid(rpcXid , rpcTxg);
     }
 
     // @Override
@@ -42,7 +43,8 @@ public class JakartaTransactionPropagationInterceptor extends TransactionPropaga
             throws Exception {
         if (RootContext.inGlobalTransaction()) {
             String rpcXid = request.getHeader(RootContext.KEY_XID);
-            this.cleanXid(rpcXid);
+            String rpcTxg = request.getHeader(RootContext.KEY_TXG);
+            this.cleanXid(rpcXid , rpcTxg);
         }
     }
 }

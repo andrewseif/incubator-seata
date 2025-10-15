@@ -35,7 +35,8 @@ public class TransactionPropagationInterceptor implements HandlerInterceptorAdap
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
         String rpcXid = request.getHeader(RootContext.KEY_XID);
-        return this.bindXid(rpcXid);
+        String rpcTxg = request.getHeader(RootContext.KEY_TXG);
+        return this.bindXid(rpcXid, rpcTxg);
     }
 
     @Override
@@ -43,18 +44,22 @@ public class TransactionPropagationInterceptor implements HandlerInterceptorAdap
             throws Exception {
         if (RootContext.inGlobalTransaction()) {
             String rpcXid = request.getHeader(RootContext.KEY_XID);
-            this.cleanXid(rpcXid);
+            String rpcTxg = request.getHeader(RootContext.KEY_TXG);
+            this.cleanXid(rpcXid, rpcTxg);
         }
     }
 
-    protected boolean bindXid(String rpcXid) {
+    protected boolean bindXid(String rpcXid,String rpcTxg) {
         String xid = RootContext.getXID();
 
         if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("xid in RootContext[{}] xid in HttpContext[{}]", xid, rpcXid);
+            LOGGER.debug("xid in RootContext[{}] xid in HttpContext[{}] txg in HttpContext[{}]", xid, rpcXid, rpcTxg);
         }
         if (StringUtils.isBlank(xid) && StringUtils.isNotBlank(rpcXid)) {
             RootContext.bind(rpcXid);
+            if (StringUtils.isNotBlank(rpcTxg)) {
+                RootContext.bindTXG(rpcTxg);
+            }
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("bind[{}] to RootContext", rpcXid);
             }
@@ -63,7 +68,8 @@ public class TransactionPropagationInterceptor implements HandlerInterceptorAdap
         return true;
     }
 
-    protected void cleanXid(String rpcXid) {
+    protected void cleanXid(String rpcXid ,String rpcTxg) {
         XidResource.cleanXid(rpcXid);
+        RootContext.unbindTXG();
     }
 }

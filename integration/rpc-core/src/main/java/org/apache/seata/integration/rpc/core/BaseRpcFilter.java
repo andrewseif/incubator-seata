@@ -23,7 +23,7 @@ import org.apache.seata.core.context.RootContext;
 import java.util.Map;
 
 public interface BaseRpcFilter<T> {
-    String[] TRX_CONTEXT_KEYS = new String[] {RootContext.KEY_XID, RootContext.KEY_BRANCH_TYPE};
+    String[] TRX_CONTEXT_KEYS = new String[] {RootContext.KEY_XID, RootContext.KEY_BRANCH_TYPE, RootContext.KEY_TXG};
 
     default String getValueFromMap(Map<String, String> rpcContextMap, String key) {
         return rpcContextMap.get(key);

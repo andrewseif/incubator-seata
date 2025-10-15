@@ -26,7 +26,7 @@ import java.util.Map;
 public interface ProviderRpcFilter<T> extends BaseRpcFilter<T> {
 
     String[] TRX_CONTEXT_KEYS =
-            new String[] {RootContext.KEY_XID, RootContext.KEY_XID.toLowerCase(), RootContext.KEY_BRANCH_TYPE};
+            new String[] {RootContext.KEY_XID, RootContext.KEY_XID.toLowerCase(), RootContext.KEY_BRANCH_TYPE, RootContext.KEY_TXG};
 
     String LOW_KEY_XID = "tx_xid";
 
@@ -71,6 +71,9 @@ public interface ProviderRpcFilter<T> extends BaseRpcFilter<T> {
                             RootContext.bindBranchType(BranchType.TCC);
                         }
                         break;
+                    case RootContext.KEY_TXG:
+                        RootContext.bindTXG(contextValue);
+                        break;
                     default:
                         throw new IllegalArgumentException("wrong context:" + TRX_CONTEXT_KEYS[i]);
                 }
@@ -95,6 +98,12 @@ public interface ProviderRpcFilter<T> extends BaseRpcFilter<T> {
                     }
                     if (null != contextValue) {
                         contextMap.put(RootContext.KEY_BRANCH_TYPE, contextValue.name());
+                    }
+                    break;
+                case RootContext.KEY_TXG:
+                    String txg = RootContext.unbindTXG();
+                    if (StringUtils.isNotBlank(txg)) {
+                        contextMap.put(RootContext.KEY_TXG, txg);
                     }
                     break;
                 default:

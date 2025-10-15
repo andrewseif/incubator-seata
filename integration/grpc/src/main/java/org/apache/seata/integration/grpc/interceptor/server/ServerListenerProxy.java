@@ -66,6 +66,10 @@ public class ServerListenerProxy<ReqT> extends ServerCall.Listener<ReqT> {
             if (StringUtils.equals(BranchType.TCC.name(), branchType)) {
                 RootContext.bindBranchType(BranchType.TCC);
             }
+            String txg = context.get(RootContext.KEY_TXG);
+            if (StringUtils.isNotBlank(txg)) {
+                RootContext.bindTXG(txg);
+            }
         }
         target.onHalfClose();
     }
@@ -95,5 +99,6 @@ public class ServerListenerProxy<ReqT> extends ServerCall.Listener<ReqT> {
         if (BranchType.TCC == previousBranchType) {
             RootContext.unbindBranchType();
         }
+        RootContext.unbindTXG();
     }
 }

@@ -150,8 +150,12 @@ public abstract class AbstractHttpExecutor implements HttpExecutor {
             throws IOException {
         CloseableHttpResponse response;
         String xid = RootContext.getXID();
+        String txg = RootContext.getTXG();
         if (xid != null) {
             headers.put(RootContext.KEY_XID, xid);
+        }
+        if (txg != null) {
+            headers.put(RootContext.KEY_TXG, txg);
         }
         if (!headers.isEmpty()) {
             headers.forEach(httpUriRequest::addHeader);

@@ -34,6 +34,7 @@ public class RpcMessage implements Serializable {
     private byte compressor;
     private Map<String, String> headMap = new HashMap<>();
     private Object body;
+    public static final String KEY_TXG = "TX_TXG";
 
     private String otherSideVersion;
 

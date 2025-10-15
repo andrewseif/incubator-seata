@@ -46,6 +46,11 @@ public class RootContext {
      */
     public static final String KEY_XID = "TX_XID";
 
+    /**
+     * The constant KEY_TXG.
+     */
+    public static final String KEY_TXG = "TX_TXG";
+
     public static final String KEY_BRANCHID = "TX_BRANCHID";
 
     /**
@@ -278,6 +283,49 @@ public class RootContext {
             throw new ShouldNeverHappenException(
                     String.format("expect has not xid, but was:%s", CONTEXT_HOLDER.get(KEY_XID)));
         }
+    }
+
+    /**
+     * Gets TXG.
+     *
+     * @return the TXG identifier
+     */
+    @Nullable
+    public static String getTXG() {
+        return (String) CONTEXT_HOLDER.get(KEY_TXG);
+    }
+
+    /**
+     * Bind TXG.
+     *
+     * @param txg the TXG identifier
+     */
+    public static void bindTXG(@Nonnull String txg) {
+        if (StringUtils.isBlank(txg)) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("TXG is blank, switch to unbind operation!");
+            }
+            unbindTXG();
+        } else {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("bind TXG {}", txg);
+            }
+            CONTEXT_HOLDER.put(KEY_TXG, txg);
+        }
+    }
+
+    /**
+     * Unbind TXG.
+     *
+     * @return the previous TXG or null
+     */
+    @Nullable
+    public static String unbindTXG() {
+        String txg = (String) CONTEXT_HOLDER.remove(KEY_TXG);
+        if (txg != null && LOGGER.isDebugEnabled()) {
+            LOGGER.debug("unbind TXG {}", txg);
+        }
+        return txg;
     }
 
     /**

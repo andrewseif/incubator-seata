@@ -49,8 +49,12 @@ public class ServerTransactionInterceptor implements ServerInterceptor {
             ServerCall<ReqT, RespT> serverCall, Metadata metadata, ServerCallHandler<ReqT, RespT> serverCallHandler) {
         String xid = getRpcXid(metadata);
         String branchName = getBranchName(metadata);
+        String txg = getTxg(metadata);
         Map<String, String> context = new HashMap<>();
         context.put(RootContext.KEY_BRANCH_TYPE, branchName);
+        if (txg != null) {
+            context.put(RootContext.KEY_TXG, txg);
+        }
         return new ServerListenerProxy<>(
                 xid, Collections.unmodifiableMap(context), serverCallHandler.startCall(serverCall, metadata));
     }
@@ -72,5 +76,12 @@ public class ServerTransactionInterceptor implements ServerInterceptor {
      */
     private String getBranchName(Metadata metadata) {
         return metadata.get(GrpcHeaderKey.BRANCH_HEADER_KEY);
+    }
+
+    /**
+     * Extracts the TXG identifier from metadata headers.
+     */
+    private String getTxg(Metadata metadata) {
+        return metadata.get(GrpcHeaderKey.TXG_HEADER_KEY);
     }
 }

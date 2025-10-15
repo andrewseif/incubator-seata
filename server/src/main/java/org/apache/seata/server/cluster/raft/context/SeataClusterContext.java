@@ -40,6 +40,11 @@ public class SeataClusterContext {
      */
     public static final String KEY_GROUP = "TX_GROUP";
 
+    /**
+     * The constant KEY_TXG for Transaction Group.
+     */
+    public static final String KEY_TXG = "TX_TXG";
+
     private static ContextCore CONTEXT_HOLDER = ContextCoreLoader.load();
 
     /**
@@ -70,5 +75,31 @@ public class SeataClusterContext {
     @Nullable
     public static String getGroup() {
         return (String) CONTEXT_HOLDER.get(KEY_GROUP);
+    }
+
+    /**
+     * Bind TXG.
+     *
+     * @param txg the transaction group identifier
+     */
+    public static void bindTXG(@Nonnull String txg) {
+        CONTEXT_HOLDER.put(KEY_TXG, txg);
+    }
+
+    /**
+     * Unbind TXG.
+     */
+    public static void unbindTXG() {
+        CONTEXT_HOLDER.remove(KEY_TXG);
+    }
+
+    /**
+     * Get current TXG.
+     *
+     * @return the TXG identifier or null
+     */
+    @Nullable
+    public static String getTXG() {
+        return (String) CONTEXT_HOLDER.get(KEY_TXG);
     }
 }

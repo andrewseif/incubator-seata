@@ -47,14 +47,18 @@ public class AlibabaDubboTransactionProviderFilter implements Filter {
         }
         String rpcXid = getRpcXid();
         String rpcBranchType = RpcContext.getContext().getAttachment(RootContext.KEY_BRANCH_TYPE);
+        String rpcTxg = RpcContext.getContext().getAttachment(RootContext.KEY_TXG);
         if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("xid in RpcContext[{}], branchType in RpcContext[{}]", rpcXid, rpcBranchType);
+            LOGGER.debug("xid in RpcContext[{}], branchType in RpcContext[{}], txg in RpcContext[{}]", rpcXid, rpcBranchType, rpcTxg);
         }
         boolean bind = false;
         if (rpcXid != null) {
             RootContext.bind(rpcXid);
             if (StringUtils.equals(BranchType.TCC.name(), rpcBranchType)) {
                 RootContext.bindBranchType(BranchType.TCC);
+            }
+            if (StringUtils.isNotBlank(rpcTxg)) {
+                RootContext.bindTXG(rpcTxg);
             }
             bind = true;
         }
@@ -68,6 +72,7 @@ public class AlibabaDubboTransactionProviderFilter implements Filter {
                 if (BranchType.TCC == previousBranchType) {
                     RootContext.unbindBranchType();
                 }
+                RootContext.unbindTXG();
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug("unbind xid [{}] branchType [{}] from RootContext", unbindXid, previousBranchType);
                 }
@@ -85,11 +90,16 @@ public class AlibabaDubboTransactionProviderFilter implements Filter {
                             RootContext.bindBranchType(BranchType.TCC);
                             LOGGER.warn("bind branchType [{}] back to RootContext", previousBranchType);
                         }
+                        if (StringUtils.isNotBlank(rpcTxg)) {
+                            RootContext.bindTXG(rpcTxg);
+                            LOGGER.warn("bind txg [{}] back to RootContext", rpcTxg);
+                        }
                     }
                 }
             }
             RpcContext.getServerContext().removeAttachment(RootContext.KEY_XID);
             RpcContext.getServerContext().removeAttachment(RootContext.KEY_BRANCH_TYPE);
+            RpcContext.getServerContext().removeAttachment(RootContext.KEY_TXG);
         }
     }
 

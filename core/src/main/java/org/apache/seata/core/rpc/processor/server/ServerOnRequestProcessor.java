@@ -24,6 +24,7 @@ import org.apache.seata.common.util.CollectionUtils;
 import org.apache.seata.common.util.NetUtil;
 import org.apache.seata.common.util.StringUtils;
 import org.apache.seata.config.ConfigurationFactory;
+import org.apache.seata.core.context.RootContext;
 import org.apache.seata.core.protocol.AbstractMessage;
 import org.apache.seata.core.protocol.AbstractResultMessage;
 import org.apache.seata.core.protocol.BatchResultMessage;
@@ -150,78 +151,98 @@ public class ServerOnRequestProcessor implements RemotingProcessor, Disposable {
     private void onRequestMessage(ChannelHandlerContext ctx, RpcMessage rpcMessage) {
         Object message = rpcMessage.getBody();
         RpcContext rpcContext = ChannelManager.getContextFromIdentified(ctx.channel());
-        if (!(message instanceof AbstractMessage)) {
-            LOGGER.error("unrecognized message:{}", message);
-            return;
-        }
-        // the batch send request message
-        if (message instanceof MergedWarpMessage) {
-            if (NettyServerConfig.isEnableTcServerBatchSendResponse()
-                    && StringUtils.isNotBlank(rpcContext.getVersion())
-                    && Version.isAboveOrEqualVersion150(rpcContext.getVersion())) {
-                List<AbstractMessage> msgs = ((MergedWarpMessage) message).msgs;
-                List<Integer> msgIds = ((MergedWarpMessage) message).msgIds;
-                for (int i = 0; i < msgs.size(); i++) {
-                    AbstractMessage msg = msgs.get(i);
-                    int msgId = msgIds.get(i);
-                    if (PARALLEL_REQUEST_HANDLE) {
-                        CompletableFuture.runAsync(
-                                () -> handleRequestsByMergedWarpMessageBy150(msg, msgId, rpcMessage, ctx, rpcContext));
-                    } else {
-                        handleRequestsByMergedWarpMessageBy150(msg, msgId, rpcMessage, ctx, rpcContext);
+
+        String txg = rpcMessage.getHead(RpcMessage.KEY_TXG);
+        boolean txgBound = false;
+        try {
+            if (StringUtils.isNotBlank(txg)) {
+                RootContext.bindTXG(txg);
+                txgBound = true;
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("Bound TXG {} from RpcMessage header for xid processing", txg);
+                }
+            }
+            if (!(message instanceof AbstractMessage)) {
+                LOGGER.error("unrecognized message:{}", message);
+                return;
+            }
+            // the batch send request message
+            if (message instanceof MergedWarpMessage) {
+                if (NettyServerConfig.isEnableTcServerBatchSendResponse()
+                        && StringUtils.isNotBlank(rpcContext.getVersion())
+                        && Version.isAboveOrEqualVersion150(rpcContext.getVersion())) {
+                    List<AbstractMessage> msgs = ((MergedWarpMessage) message).msgs;
+                    List<Integer> msgIds = ((MergedWarpMessage) message).msgIds;
+                    for (int i = 0; i < msgs.size(); i++) {
+                        AbstractMessage msg = msgs.get(i);
+                        int msgId = msgIds.get(i);
+                        if (PARALLEL_REQUEST_HANDLE) {
+                            CompletableFuture.runAsync(
+                                    () -> handleRequestsByMergedWarpMessageBy150(msg, msgId, rpcMessage, ctx, rpcContext));
+                        } else {
+                            handleRequestsByMergedWarpMessageBy150(msg, msgId, rpcMessage, ctx, rpcContext);
+                        }
                     }
+                } else {
+                    List<AbstractResultMessage> results = new ArrayList<>();
+                    List<CompletableFuture<AbstractResultMessage>> completableFutures = null;
+                    for (int i = 0; i < ((MergedWarpMessage) message).msgs.size(); i++) {
+                        if (PARALLEL_REQUEST_HANDLE) {
+                            if (completableFutures == null) {
+                                completableFutures = new ArrayList<>();
+                            }
+                            int finalI = i;
+                            completableFutures.add(CompletableFuture.supplyAsync(() -> handleRequestsByMergedWarpMessage(
+                                    ((MergedWarpMessage) message).msgs.get(finalI), rpcContext)));
+                        } else {
+                            results.add(
+                                    i,
+                                    handleRequestsByMergedWarpMessage(
+                                            ((MergedWarpMessage) message).msgs.get(i), rpcContext));
+                        }
+                    }
+                    if (CollectionUtils.isNotEmpty(completableFutures)) {
+                        try {
+                            for (CompletableFuture<AbstractResultMessage> completableFuture : completableFutures) {
+                                results.add(completableFuture.get());
+                            }
+                        } catch (InterruptedException | ExecutionException e) {
+                            LOGGER.error("handle request error: {}", e.getMessage(), e);
+                        }
+                    }
+                    MergeResultMessage resultMessage = new MergeResultMessage();
+                    resultMessage.setMsgs(results.toArray(new AbstractResultMessage[0]));
+                    remotingServer.sendAsyncResponse(rpcMessage, ctx.channel(), resultMessage);
                 }
             } else {
-                List<AbstractResultMessage> results = new ArrayList<>();
-                List<CompletableFuture<AbstractResultMessage>> completableFutures = null;
-                for (int i = 0; i < ((MergedWarpMessage) message).msgs.size(); i++) {
-                    if (PARALLEL_REQUEST_HANDLE) {
-                        if (completableFutures == null) {
-                            completableFutures = new ArrayList<>();
-                        }
-                        int finalI = i;
-                        completableFutures.add(CompletableFuture.supplyAsync(() -> handleRequestsByMergedWarpMessage(
-                                ((MergedWarpMessage) message).msgs.get(finalI), rpcContext)));
-                    } else {
-                        results.add(
-                                i,
-                                handleRequestsByMergedWarpMessage(
-                                        ((MergedWarpMessage) message).msgs.get(i), rpcContext));
-                    }
+                // the single send request message
+                final AbstractMessage msg = (AbstractMessage) message;
+                if (LOGGER.isInfoEnabled()) {
+                    String receiveMsgLog = String.format(
+                            "receive msg[single]: %s, clientIp: %s, vgroup: %s",
+                            message,
+                            NetUtil.toIpAddress(ctx.channel().remoteAddress()),
+                            rpcContext.getTransactionServiceGroup());
+                    BatchLogHandler.INSTANCE.writeLog(receiveMsgLog);
                 }
-                if (CollectionUtils.isNotEmpty(completableFutures)) {
-                    try {
-                        for (CompletableFuture<AbstractResultMessage> completableFuture : completableFutures) {
-                            results.add(completableFuture.get());
-                        }
-                    } catch (InterruptedException | ExecutionException e) {
-                        LOGGER.error("handle request error: {}", e.getMessage(), e);
-                    }
+                AbstractResultMessage result = transactionMessageHandler.onRequest(msg, rpcContext);
+                remotingServer.sendAsyncResponse(rpcMessage, ctx.channel(), result);
+                if (LOGGER.isInfoEnabled()) {
+                    String resultMsgLog = String.format(
+                            "result msg[single]: %s, clientIp: %s, vgroup: %s",
+                            result,
+                            NetUtil.toIpAddress(ctx.channel().remoteAddress()),
+                            rpcContext.getTransactionServiceGroup());
+                    BatchLogHandler.INSTANCE.writeLog(resultMsgLog);
                 }
-                MergeResultMessage resultMessage = new MergeResultMessage();
-                resultMessage.setMsgs(results.toArray(new AbstractResultMessage[0]));
-                remotingServer.sendAsyncResponse(rpcMessage, ctx.channel(), resultMessage);
             }
-        } else {
-            // the single send request message
-            final AbstractMessage msg = (AbstractMessage) message;
-            if (LOGGER.isInfoEnabled()) {
-                String receiveMsgLog = String.format(
-                        "receive msg[single]: %s, clientIp: %s, vgroup: %s",
-                        message,
-                        NetUtil.toIpAddress(ctx.channel().remoteAddress()),
-                        rpcContext.getTransactionServiceGroup());
-                BatchLogHandler.INSTANCE.writeLog(receiveMsgLog);
-            }
-            AbstractResultMessage result = transactionMessageHandler.onRequest(msg, rpcContext);
-            remotingServer.sendAsyncResponse(rpcMessage, ctx.channel(), result);
-            if (LOGGER.isInfoEnabled()) {
-                String resultMsgLog = String.format(
-                        "result msg[single]: %s, clientIp: %s, vgroup: %s",
-                        result,
-                        NetUtil.toIpAddress(ctx.channel().remoteAddress()),
-                        rpcContext.getTransactionServiceGroup());
-                BatchLogHandler.INSTANCE.writeLog(resultMsgLog);
+        } finally {
+            // Always unbind TXG after processing to avoid context pollution
+            if (txgBound) {
+                RootContext.unbindTXG();
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("Unbound TXG {} after request processing", txg);
+                }
             }
         }
     }

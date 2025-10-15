@@ -46,6 +46,7 @@ public class AlibabaDubboTransactionConsumerFilter implements Filter {
         }
         String xid = RootContext.getXID();
         BranchType branchType = RootContext.getBranchType();
+        String txg = RootContext.getTXG();
 
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug("consumer xid in RootContext[{}], branchType in RootContext[{}]", xid, branchType);
@@ -53,12 +54,16 @@ public class AlibabaDubboTransactionConsumerFilter implements Filter {
         if (xid != null) {
             RpcContext.getContext().setAttachment(RootContext.KEY_XID, xid);
             RpcContext.getContext().setAttachment(RootContext.KEY_BRANCH_TYPE, branchType.name());
+            if (txg != null) {
+                RpcContext.getContext().setAttachment(RootContext.KEY_TXG, txg);
+            }
         }
         try {
             return invoker.invoke(invocation);
         } finally {
             RpcContext.getContext().removeAttachment(RootContext.KEY_XID);
             RpcContext.getContext().removeAttachment(RootContext.KEY_BRANCH_TYPE);
+            RpcContext.getContext().removeAttachment(RootContext.KEY_TXG);
         }
     }
 }

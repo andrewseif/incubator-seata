@@ -38,6 +38,7 @@ public class HsfTransactionConsumerFilter implements ClientFilter {
     public ListenableFuture<RPCResult> invoke(InvocationHandler nextHandler, Invocation invocation) throws Throwable {
         String xid = RootContext.getXID();
         BranchType branchType = RootContext.getBranchType();
+        String txg = RootContext.getTXG();
 
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug("xid in RootContext[{}], branchType in RootContext[{}]", xid, branchType);
@@ -45,12 +46,16 @@ public class HsfTransactionConsumerFilter implements ClientFilter {
         if (xid != null) {
             RPCContext.getClientContext().putAttachment(RootContext.KEY_XID, xid);
             RPCContext.getClientContext().putAttachment(RootContext.KEY_BRANCH_TYPE, branchType.name());
+            if (txg != null) {
+                RPCContext.getClientContext().putAttachment(RootContext.KEY_TXG, txg);
+            }
         }
         try {
             return nextHandler.invoke(invocation);
         } finally {
             RPCContext.getClientContext().removeAttachment(RootContext.KEY_XID);
             RPCContext.getClientContext().removeAttachment(RootContext.KEY_BRANCH_TYPE);
+            RPCContext.getClientContext().removeAttachment(RootContext.KEY_TXG);
         }
     }
 

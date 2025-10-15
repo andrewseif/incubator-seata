@@ -40,14 +40,18 @@ public class HsfTransactionProviderFilter implements ServerFilter {
 
         Object rpcXid = RPCContext.getServerContext().getAttachment(RootContext.KEY_XID);
         Object rpcBranchType = RPCContext.getServerContext().getAttachment(RootContext.KEY_BRANCH_TYPE);
+        Object rpcTxg = RPCContext.getServerContext().getAttachment(RootContext.KEY_TXG);
         if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("xid in RpcContext[{}], branchType in RpcContext[{}]", rpcXid, rpcBranchType);
+            LOGGER.debug("xid in RpcContext[{}], branchType in RpcContext[{}], txg in RpcContext[{}]", rpcXid, rpcBranchType, rpcTxg);
         }
         boolean bind = false;
         if (rpcXid != null) {
             RootContext.bind(rpcXid.toString());
             if (StringUtils.equals(BranchType.TCC.name(), rpcBranchType.toString())) {
                 RootContext.bindBranchType(BranchType.TCC);
+            }
+            if (rpcTxg != null && StringUtils.isNotBlank(rpcTxg.toString())) {
+                RootContext.bindTXG(rpcTxg.toString());
             }
             bind = true;
             if (LOGGER.isDebugEnabled()) {
@@ -63,6 +67,7 @@ public class HsfTransactionProviderFilter implements ServerFilter {
                 if (BranchType.TCC == previousBranchType) {
                     RootContext.unbindBranchType();
                 }
+                RootContext.unbindTXG();
                 if (LOGGER.isDebugEnabled()) {
                     LOGGER.debug("unbind xid [{}] branchType [{}] from RootContext", unbindXid, previousBranchType);
                 }
@@ -80,11 +85,16 @@ public class HsfTransactionProviderFilter implements ServerFilter {
                             RootContext.bindBranchType(BranchType.TCC);
                             LOGGER.warn("bind branchType [{}] back to RootContext", previousBranchType);
                         }
+                        if (rpcTxg != null && StringUtils.isNotBlank(rpcTxg.toString())) {
+                            RootContext.bindTXG(rpcTxg.toString());
+                            LOGGER.warn("bind txg [{}] back to RootContext", rpcTxg);
+                        }
                     }
                 }
             }
             RPCContext.getServerContext().removeAttachment(RootContext.KEY_XID);
             RPCContext.getServerContext().removeAttachment(RootContext.KEY_BRANCH_TYPE);
+            RPCContext.getServerContext().removeAttachment(RootContext.KEY_TXG);
         }
     }
 
