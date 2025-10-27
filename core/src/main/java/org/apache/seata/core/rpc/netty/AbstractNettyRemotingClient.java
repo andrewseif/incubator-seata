@@ -31,6 +31,8 @@ import org.apache.seata.common.thread.NamedThreadFactory;
 import org.apache.seata.common.util.CollectionUtils;
 import org.apache.seata.common.util.NetUtil;
 import org.apache.seata.common.util.StringUtils;
+import org.apache.seata.config.ConfigurationFactory;
+import org.apache.seata.core.context.RootContext;
 import org.apache.seata.core.protocol.AbstractMessage;
 import org.apache.seata.core.protocol.HeartbeatMessage;
 import org.apache.seata.core.protocol.MergeMessage;
@@ -69,6 +71,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 
+import static org.apache.seata.common.DefaultValues.DEFAULT_LOAD_BALANCE;
 import static org.apache.seata.common.exception.FrameworkErrorCode.NoAvailableService;
 
 /**
@@ -302,12 +305,37 @@ public abstract class AbstractNettyRemotingClient extends AbstractNettyRemoting 
     protected InetSocketAddress doSelect(List<InetSocketAddress> list, Object msg) throws Exception {
         if (CollectionUtils.isNotEmpty(list)) {
             if (list.size() > 1) {
+                String identifier = getLoadBalanceIdentifier(msg);
                 return LoadBalanceFactory.getInstance().select(list, getXid(msg));
             } else {
                 return list.get(0);
             }
         }
         return null;
+    }
+
+    /**
+     * Get the identifier for load balancing based on the configured load balance type.
+     * If TXG load balance is configured and TXG is present in RootContext, use TXG.
+     * Otherwise, use XID.
+     *
+     * @param msg the message
+     * @return the identifier for load balancing
+     */
+    protected String getLoadBalanceIdentifier(Object msg) {
+        String loadBalanceType = ConfigurationFactory.getInstance()
+                .getConfig(LoadBalanceFactory.LOAD_BALANCE_TYPE, DEFAULT_LOAD_BALANCE);
+
+        // If TXG load balance is configured, try to use TXG from RootContext
+        if (LoadBalanceFactory.TXG_LOAD_BALANCE.equals(loadBalanceType)) {
+            String txg = RootContext.getTXG();
+            if (StringUtils.isNotBlank(txg)) {
+                return txg;
+            }
+        }
+
+        // Default to XID
+        return getXid(msg);
     }
 
     protected String getXid(Object msg) {
